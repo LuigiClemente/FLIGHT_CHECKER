@@ -1,3 +1,17 @@
+```mermaid
+graph TD
+    A(Load Flight Data Task) --> B(Analyze Delays Task)
+    B --> C{Delay Threshold Met?}
+    C -->|Yes| D(Trigger Jenkins Job)
+    C -->|No| E(Skip Notification Task)
+    style A fill:#FFD700, stroke:#000, stroke-width:2px
+    style B fill:#87CEEB, stroke:#000, stroke-width:2px
+    style C fill:#FFA500, stroke:#000, stroke-width:2px
+    style D fill:#90EE90, stroke:#000, stroke-width:2px
+    style E fill:#FF0000, stroke:#000, stroke-width:2px
+```
+
+
 Flight Checker
 --------------
 
