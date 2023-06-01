@@ -31,6 +31,50 @@ def validate_environment_variables():
         if not os.getenv(var):
             raise ValueError(f"Environment variable {var} is missing or empty")
 
+class DelayedApiCallSensor(BaseSensorOperator):
+    @apply_defaults
+    def __init__(self, *args, **kwargs):
+        super(DelayedApiCallSensor, self).__init__(*args, **kwargs)
+        self.last_api_call_time = None
+
+    def poke(self, context):
+        flight_checker = FlightChecker()
+        ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays')
+
+        current_time = datetime.now()
+
+        next_call_time = flight_checker.get_next_call_time(ongoing_delays, current_time)
+
+        if self.last_api_call_time is None or self.last_api_call_time < next_call_time:
+            if current_time >= next_call_time:
+                self.last_api_call_time = current_time  # Record the last successful API call time
+                return True
+            else:
+                return False
+        else:
+            return False
+def get_next_call_time(self, ongoing_delays, current_time):
+        """
+        Determine the next API call time based on the current state of delays and time of day.
+        Args:
+            ongoing_delays (bool): If there are any ongoing flight delays
+            current_time (datetime): Current datetime
+        Returns:
+            next_call_time (datetime): The next API call time
+        """
+        if ongoing_delays:
+            # If there are ongoing delays, check every hour
+            api_call_time_ongoing_delays = int(os.getenv("API_CALL_TIME_ONGOING_DELAYS", "1"))
+            next_call_time = current_time + timedelta(hours=api_call_time_ongoing_delays)
+        elif current_time.hour < 7:
+            # If it's before 7 AM, check at 10 AM
+            next_call_time = current_time.replace(hour=10, minute=0, second=0)
+        else:
+            # Otherwise, check every 3 hours
+            api_call_time_default = int(os.getenv("API_CALL_TIME_DEFAULT", "3"))
+            next_call_time = current_time + timedelta(hours=api_call_time_default)
+
+        return next_call_time
 
 class FlightChecker:
     def __init__(self):
@@ -190,54 +234,6 @@ class FlightChecker:
         except Exception as e:
             logging.error(f"Error creating CSV file: {str(e)}")
             raise
-
-    def get_next_call_time(self, ongoing_delays, current_time):
-        """
-        Determine the next API call time based on the current state of delays and time of day.
-        Args:
-            ongoing_delays (bool): If there are any ongoing flight delays
-            current_time (datetime): Current datetime
-        Returns:
-            next_call_time (datetime): The next API call time
-        """
-        if ongoing_delays:
-            # If there are ongoing delays, check every hour
-            api_call_time_ongoing_delays = int(os.getenv("API_CALL_TIME_ONGOING_DELAYS", "1"))
-            next_call_time = current_time + timedelta(hours=api_call_time_ongoing_delays)
-        elif current_time.hour < 7:
-            # If it's before 7 AM, check at 10 AM
-            next_call_time = current_time.replace(hour=10, minute=0, second=0)
-        else:
-            # Otherwise, check every 3 hours
-            api_call_time_default = int(os.getenv("API_CALL_TIME_DEFAULT", "3"))
-            next_call_time = current_time + timedelta(hours=api_call_time_default)
-
-        return next_call_time
-
-
-class DelayedApiCallSensor(BaseSensorOperator):
-    @apply_defaults
-    def __init__(self, *args, **kwargs):
-        super(DelayedApiCallSensor, self).__init__(*args, **kwargs)
-        self.last_api_call_time = None
-
-    def poke(self, context):
-        flight_checker = FlightChecker()
-        ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays')
-
-        current_time = datetime.now()
-
-        next_call_time = flight_checker.get_next_call_time(ongoing_delays, current_time)
-
-        if self.last_api_call_time is None or self.last_api_call_time < next_call_time:
-            if current_time >= next_call_time:
-                self.last_api_call_time = current_time  # Record the last successful API call time
-                return True
-            else:
-                return False
-        else:
-            return False
-
 
 default_args = {
     'start_date': datetime.strptime(os.getenv("DAG_START_DATE", "2023-05-21"), "%Y-%m-%d"),
