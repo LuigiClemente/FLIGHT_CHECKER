@@ -53,28 +53,6 @@ class DelayedApiCallSensor(BaseSensorOperator):
                 return False
         else:
             return False
-def get_next_call_time(self, ongoing_delays, current_time):
-        """
-        Determine the next API call time based on the current state of delays and time of day.
-        Args:
-            ongoing_delays (bool): If there are any ongoing flight delays
-            current_time (datetime): Current datetime
-        Returns:
-            next_call_time (datetime): The next API call time
-        """
-        if ongoing_delays:
-            # If there are ongoing delays, check every hour
-            api_call_time_ongoing_delays = int(os.getenv("API_CALL_TIME_ONGOING_DELAYS", "1"))
-            next_call_time = current_time + timedelta(hours=api_call_time_ongoing_delays)
-        elif current_time.hour < 7:
-            # If it's before 7 AM, check at 10 AM
-            next_call_time = current_time.replace(hour=10, minute=0, second=0)
-        else:
-            # Otherwise, check every 3 hours
-            api_call_time_default = int(os.getenv("API_CALL_TIME_DEFAULT", "3"))
-            next_call_time = current_time + timedelta(hours=api_call_time_default)
-
-        return next_call_time
 
 class FlightChecker:
     def __init__(self):
@@ -201,6 +179,29 @@ class FlightChecker:
         except Exception as e:
             logging.error(f"Error analyzing delays: {str(e)}")
             raise
+    
+    def get_next_call_time(self, ongoing_delays, current_time):
+        """
+        Determine the next API call time based on the current state of delays and time of day.
+        Args:
+            ongoing_delays (bool): If there are any ongoing flight delays
+            current_time (datetime): Current datetime
+        Returns:
+            next_call_time (datetime): The next API call time
+        """
+        if ongoing_delays:
+            # If there are ongoing delays, check every hour
+            api_call_time_ongoing_delays = int(os.getenv("API_CALL_TIME_ONGOING_DELAYS", "1"))
+            next_call_time = current_time + timedelta(hours=api_call_time_ongoing_delays)
+        elif current_time.hour < 7:
+            # If it's before 7 AM, check at 10 AM
+            next_call_time = current_time.replace(hour=10, minute=0, second=0)
+        else:
+            # Otherwise, check every 3 hours
+            api_call_time_default = int(os.getenv("API_CALL_TIME_DEFAULT", "3"))
+            next_call_time = current_time + timedelta(hours=api_call_time_default)
+
+        return next_call_time
 
     def create_csv_file(self, **context):
         """
