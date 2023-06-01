@@ -278,7 +278,7 @@ class FlightChecker:
         except Exception as e:
             self.log.error(f"Error creating CSV file: {str(e)}")
             raise
-            
+
 flight_checker = FlightChecker()
 flight_checker.analyze_delays()
 
