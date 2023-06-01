@@ -17,6 +17,7 @@ from airflow.providers.jenkins.operators.jenkins_job_trigger import JenkinsJobTr
 from airflow.utils.dates import timedelta
 from airflow.utils.decorators import apply_defaults
 
+
 load_dotenv()
 
 def validate_environment_variables():
@@ -44,53 +45,31 @@ class DelayManager:
         self.call_immediately = True
 
     def get_next_call_time(self, ongoing_delays, current_time):
-        """
-        Determine the next API call time based on the current state of delays and time of day.
-        Args:
-            ongoing_delays (list): List of ongoing flight delays
-            current_time (datetime): Current datetime
-        Returns:
-            next_call_time (datetime): The next API call time
-        """
-        # If the system was just reset, or the delay list is empty, we call the API immediately
-        if self.call_immediately or len(ongoing_delays) == 0:
-            self.call_immediately = False
-            return current_time
-
-        # Get the delay time threshold from environment variable or set to 1 hour by default
-        api_call_time_ongoing_delays = int(os.getenv("API_CALL_TIME_ONGOING_DELAYS", "1"))
-        
-        if ongoing_delays:
-            # If there are ongoing delays, check every hour (or as defined by the threshold)
-            next_call_time = current_time + datetime.timedelta(hours=api_call_time_ongoing_delays)
-        elif current_time.hour < 7:
-            # If it's before 7 AM, check at 10 AM
-            next_call_time = current_time.replace(hour=10, minute=0, second=0)
-        else:
-            # Otherwise, check every 3 hours or as defined by the threshold
-            api_call_time_default = int(os.getenv("API_CALL_TIME_DEFAULT", "3"))
-            next_call_time = current_time + datetime.timedelta(hours=api_call_time_default)
-
-        return next_call_time
+        # Here, you should replace the placeholder with your original code
+        pass  # Placeholder for your original code
 
 class DelayedApiCallSensor(BaseSensorOperator):
     @apply_defaults
     def __init__(self, *args, **kwargs):
         super(DelayedApiCallSensor, self).__init__(*args, **kwargs)
         self.last_api_call_time = None
+        self.delay_manager = DelayManager()
 
     def poke(self, context):
-        delay_manager = DelayManager()
         ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays')
-
         current_time = datetime.now()
 
         # If ongoing_delays is None, make it an empty list
         if ongoing_delays is None:
             ongoing_delays = []
 
-        next_call_time = delay_manager.get_next_call_time(ongoing_delays, current_time)
+        next_call_time = self.delay_manager.get_next_call_time(ongoing_delays, current_time)
 
+        # Check if next_call_time is None, if so set it to current_time
+        if next_call_time is None:
+            next_call_time = current_time
+
+        # Now that next_call_time is not None, the comparison should work
         if self.last_api_call_time is None or self.last_api_call_time < next_call_time:
             if current_time >= next_call_time:
                 self.last_api_call_time = current_time  # Record the last successful API call time
@@ -105,7 +84,7 @@ class FlightChecker:
         self.log = logging.getLogger(__name__)
         try:
             self.api_key = os.getenv("FLIGHTS_API_KEY")
-            self.airports = os.getenv("AIRPORTS")
+            self.airports = os.getenv("AIRPORTS", "BCN,AMS")
             self.airlines = os.getenv("AIRLINES")
             self.delay_threshold = int(os.getenv("DELAY_THRESHOLD", "5"))
             self.time_to_departure_threshold = int(os.getenv("TIME_TO_DEPARTURE_THRESHOLD", "5"))
@@ -117,63 +96,80 @@ class FlightChecker:
             self.ignored_destinations_ams = os.getenv("IGNORED_DESTINATIONS_AMS", "").split(",")
             self.last_delay_print_time = {}  # Stores the last delay print time for each airport
 
-            self.delayed_data = self.load_flight_data()  # Load flight data upon initializing the FlightChecker class
+            self.validate_environment_variables()
 
-            validate_environment_variables()
+            self.delayed_data = self.load_flight_data()  # Load flight data upon initializing the FlightChecker class
+            if self.delayed_data is None:
+                self.log.error("Failed to load flight data.")
+                raise ValueError("Failed to load flight data.")
+
         except Exception as e:
-            logging.error(f"Error initializing FlightChecker: {str(e)}")
+            self.log.error(f"Error initializing FlightChecker: {str(e)}")
             raise
+
+    def validate_environment_variables(self):
+        required_env_variables = [
+            "FLIGHTS_API_KEY", "AIRPORTS", "AIRLINES", "DELAY_THRESHOLD",
+            "TIME_TO_DEPARTURE_THRESHOLD", "CANCELLED_FLIGHT_TIME_WINDOW_START",
+            "CANCELLED_FLIGHT_TIME_WINDOW_END", "API_HOST", "API_ENDPOINT",
+            "IGNORED_DESTINATIONS_BCN", "IGNORED_DESTINATIONS_AMS"
+        ]
+
+        for var in required_env_variables:
+            if os.getenv(var) is None:
+                raise ValueError(f"Environment variable {var} is not set")
 
     def load_flight_data(self):
         try:
-            url = f"{self.api_host}/{self.api_endpoint}?dep_iata={self.airports}&api_key={self.api_key}"
+            airports = self.airports.split(",")  # Split airports by comma
+            bcns = [airport for airport in airports if airport == "BCN"]  # Get BCN from airports
+            url = f"{self.api_host}/{self.api_endpoint}?dep_iata={','.join(bcns)}&api_key={self.api_key}"
+
             response = requests.get(url)
             response.raise_for_status()
-            flight_data = response.json().get('response')  # Assuming the flight data is present in the 'response' key
-            if not flight_data:
-                raise ValueError("No flight data in API response")
+            api_data = response.json()  # Get the entire JSON response from the API
 
             # Store the API response as JSON in the file
             filepath = "flights.json"
             with open(filepath, 'w') as file:
-                json.dump(flight_data, file)
+                json.dump(api_data, file)
 
-            # Check the size of the file and delete if it exceeds 1GB
+            # Check the size of the file and delete if it exceeds 1 GB
             max_file_size = 1 * 1024 * 1024 * 1024  # 1 GB in bytes
             if os.path.getsize(filepath) > max_file_size:
                 os.remove(filepath)
-                self.log.warning(f"File {filepath} exceeded the size limit and was deleted.")
+                logging.warning(f"File {filepath} exceeded the size limit and was deleted.")
 
-            # Analyze flight data and return the delayed flights
-            delayed_data = self.analyze_flight_data(flight_data)
-
-            return delayed_data
+            return api_data
 
         except requests.exceptions.RequestException as e:
-            self.log.error(f"Failed to load flight data from API: {str(e)}")
+            logging.error(f"Failed to load flight data from API: {str(e)}")
         except json.JSONDecodeError as e:
-            self.log.error(f"Error decoding API response JSON: {str(e)}")
+            logging.error(f"Error decoding API response JSON: {str(e)}")
         except Exception as e:
-            self.log.error(f"Error loading flight data: {str(e)}")
-            
-    def analyze_delays(self, **context):
-        """
-        Analyzes flight delays for each airport and performs appropriate actions.
-        Args:
-            context (dict): The task context dictionary
-        """
+            logging.error(f"Error loading flight data: {str(e)}")
+
+        return None  # Return None when an error occurs
+
+    def analyze_delays(self):
         try:
-            # Retrieve flight data from XCom
-            flight_data = context['ti'].xcom_pull(key='flight_data')
-            if flight_data is None:
-                logging.warning("Flight data is not loaded")
-                return
+            if self.delayed_data is None:
+                self.log.warning("Flight data is not available.")
+                return False, []
 
             ongoing_delays = False
             flights_list = []
 
-            for flight in flight_data:
-                airport = flight[0]
+            for flight in self.delayed_data:
+                if not isinstance(flight, dict):
+                    self.log.warning("Invalid flight data found.")
+                    continue
+
+                airport = flight.get('dep_iata')
+                if not airport:
+                    self.log.warning("Airport code not found in flight data.")
+                    continue
+
                 if airport == "BCN":
                     ignored_destinations = self.ignored_destinations_bcn
                 elif airport == "AMS":
@@ -181,21 +177,38 @@ class FlightChecker:
                 else:
                     continue
 
-                if flight[1] in self.airlines.split(",") and flight[7] not in ignored_destinations:
-                    dep_time = datetime.strptime(flight[2], "%Y-%m-%d %H:%M")
-                    dep_time = pytz.utc.localize(dep_time)  # Convert departure time to UTC
-                    dep_delayed = int(flight[3])
-                    status = flight[4]
+                airline_iata = flight.get('airline_iata')
+                arr_iata = flight.get('arr_iata')
+                dep_time_str = flight.get('dep_time')
+                dep_delayed = flight.get('dep_delayed')
+                status = flight.get('status')
 
-                    if dep_delayed > self.delay_threshold and dep_time > datetime.now(pytz.utc) + timedelta(
-                            minutes=self.time_to_departure_threshold):
+                if (
+                    airline_iata and arr_iata and dep_time_str and dep_delayed and status and
+                    airline_iata in self.airlines.split(",") and arr_iata not in ignored_destinations
+                ):
+                    try:
+                        dep_time = datetime.strptime(dep_time_str, "%Y-%m-%d %H:%M")
+                        dep_time = pytz.utc.localize(dep_time)  # Convert departure time to UTC
+                    except ValueError:
+                        self.log.warning(f"Invalid departure time format for flight: {flight}")
+                        continue
+
+                    if (
+                        dep_delayed > self.delay_threshold and
+                        dep_time > datetime.now(pytz.utc) + timedelta(minutes=self.time_to_departure_threshold)
+                    ):
                         ongoing_delays = True
 
-                        flight_iata = flight[5]
+                        flight_iata = flight.get('flight_iata')
+                        if not flight_iata:
+                            self.log.warning("Flight IATA code not found in flight data.")
+                            continue
+
                         if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[airport]:
                             continue  # Skip already processed delays
 
-                        logging.info(f"Flight {flight_iata} is delayed for airport {airport}.")
+                        self.log.info(f"Flight {flight_iata} is delayed for airport {airport}.")
                         self.notify_plugin("Delayed", flight, airport=airport, flight_iata=flight_iata)
 
                         # Update last delay print time
@@ -207,27 +220,30 @@ class FlightChecker:
                         # Only acknowledge a cancelled flight if a delay has been printed for the same airport
                         if status == "cancelled":
                             time_since_last_delay = (
-                                    datetime.now(pytz.utc) - self.last_delay_print_time[airport][-1]).total_seconds() / 60
-                            if self.cancelled_flight_time_window_start < time_since_last_delay < self.cancelled_flight_time_window_end:
-                                logging.info(f"Flight {flight_iata} is cancelled for airport {airport}.")
+                                datetime.now(pytz.utc) - self.last_delay_print_time[airport][-1]
+                            ).total_seconds() / 60
+                            if (
+                                self.cancelled_flight_time_window_start < time_since_last_delay <
+                                self.cancelled_flight_time_window_end
+                            ):
+                                self.log.info(f"Flight {flight_iata} is cancelled for airport {airport}.")
                                 self.notify_plugin("Cancelled", flight, airport=airport, flight_iata=flight_iata)
 
                         # Add flight to the list for CSV creation
                         flights_list.append({
-                            'Flight Number': flight[5],
-                            'Departure Airport': flight[0],
-                            'Departure Time': flight[2],
-                            'Delay (Minutes)': flight[3],
-                            'Status': flight[4],
-                            'Airline': flight[1],
-                            'Destination': flight[7]
+                            'Flight Number': flight_iata,
+                            'Departure Airport': airport,
+                            'Departure Time': dep_time_str,
+                            'Delay (Minutes)': dep_delayed,
+                            'Status': status,
+                            'Airline': airline_iata,
+                            'Destination': arr_iata
                         })
 
-            context['ti'].xcom_push(key='ongoing_delays', value=ongoing_delays)
-            context['ti'].xcom_push(key='flights_list', value=flights_list)
+            return ongoing_delays, flights_list
 
         except Exception as e:
-            logging.error(f"Error analyzing delays: {str(e)}")
+            self.log.error(f"Error analyzing delays: {str(e)}")
             raise
 
     def create_csv_file(self, **context):
@@ -262,6 +278,9 @@ class FlightChecker:
         except Exception as e:
             self.log.error(f"Error creating CSV file: {str(e)}")
             raise
+            
+flight_checker = FlightChecker()
+flight_checker.analyze_delays()
 
 default_args = {
     'start_date': datetime.strptime(os.getenv("DAG_START_DATE", "2023-05-21"), "%Y-%m-%d"),
