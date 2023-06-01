@@ -5,6 +5,8 @@ import json
 import time
 import csv
 import pytz
+import json
+
 
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -100,6 +102,7 @@ class DelayedApiCallSensor(BaseSensorOperator):
 
 class FlightChecker:
     def __init__(self):
+        self.log = logging.getLogger(__name__)
         try:
             self.api_key = os.getenv("FLIGHTS_API_KEY")
             self.airports = os.getenv("AIRPORTS")
@@ -114,41 +117,41 @@ class FlightChecker:
             self.ignored_destinations_ams = os.getenv("IGNORED_DESTINATIONS_AMS", "").split(",")
             self.last_delay_print_time = {}  # Stores the last delay print time for each airport
 
+            self.delayed_data = self.load_flight_data()  # Load flight data upon initializing the FlightChecker class
+
             validate_environment_variables()
         except Exception as e:
             logging.error(f"Error initializing FlightChecker: {str(e)}")
             raise
 
-    def load_flight_data(self, **context):
-        """
-        Loads flight data from the API and stores it in XCom.
-        Retries the API request with exponential backoff in case of failures.
-        Args:
-            context (dict): The task context dictionary
-        """
+    def load_flight_data(self):
         try:
-            url = f"{self.api_host}/{self.api_endpoint}?dep_iata={self.airports}&api_key={self.api_key}"
-            retry_count = 0
-            max_retries = int(os.getenv("API_MAX_RETRIES", "5"))
-            retry_delay_base = int(os.getenv("API_RETRY_DELAY_BASE", "2"))
-            while retry_count < max_retries:
-                try:
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    flight_data = response.json()
-                    # Store flight data in XCom
-                    context['ti'].xcom_push(key='flight_data', value=flight_data)
-                    break
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Failed to load flight data: {str(e)}")
-                    logging.info(f"Retrying in {retry_delay_base ** retry_count} seconds...")
-                    time.sleep(retry_delay_base ** retry_count)
-                    retry_count += 1
-            else:
-                raise RuntimeError("Failed to load flight data after multiple retries")
+            with open("flights.json", 'r') as file:
+                data = file.read()
+                if not data:
+                    self.log.error("flights.json file is empty")
+                    return None
+                data = json.loads(data)
+
+            def find_delayed_in_dict(obj):
+                if "delayed" in obj:
+                    return obj["delayed"]
+                for k, v in obj.items():
+                    if isinstance(v, dict):
+                        item = find_delayed_in_dict(v)
+                        if item is not None:
+                            return item
+
+            delayed_data = find_delayed_in_dict(data)
+
+            if delayed_data is None:
+                raise ValueError("No flight delay data in response")
+
+            return delayed_data
+        except json.JSONDecodeError as e:
+            self.log.error(f"Error decoding JSON: {str(e)}")
         except Exception as e:
-            logging.error(f"Error loading flight data: {str(e)}")
-            raise
+            self.log.error(f"Error loading flight data: {str(e)}")
 
     def analyze_delays(self, **context):
         """
@@ -182,11 +185,12 @@ class FlightChecker:
                     status = flight[4]
 
                     if dep_delayed > self.delay_threshold and dep_time > datetime.now(pytz.utc) + timedelta(
-                        minutes=self.time_to_departure_threshold):
+                            minutes=self.time_to_departure_threshold):
                         ongoing_delays = True
 
                         flight_iata = flight[5]
-                        if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[airport]:
+                        if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[
+                            airport]:
                             continue  # Skip already processed delays
 
                         logging.info(f"Flight {flight_iata} is delayed for airport {airport}.")
@@ -201,7 +205,7 @@ class FlightChecker:
                         # Only acknowledge a cancelled flight if a delay has been printed for the same airport
                         if status == "cancelled":
                             time_since_last_delay = (
-                                datetime.now(pytz.utc) - self.last_delay_print_time[airport][-1]).total_seconds() / 60
+                                    datetime.now(pytz.utc) - self.last_delay_print_time[airport][-1]).total_seconds() / 60
                             if self.cancelled_flight_time_window_start < time_since_last_delay < self.cancelled_flight_time_window_end:
                                 logging.info(f"Flight {flight_iata} is cancelled for airport {airport}.")
                                 self.notify_plugin("Cancelled", flight, airport=airport, flight_iata=flight_iata)
