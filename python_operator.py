@@ -107,10 +107,10 @@ class FlightChecker:
             self.api_key = os.getenv("FLIGHTS_API_KEY")
             self.airports = os.getenv("AIRPORTS")
             self.airlines = os.getenv("AIRLINES")
-            self.delay_threshold = int(os.getenv("DELAY_THRESHOLD", "180"))
-            self.time_to_departure_threshold = int(os.getenv("TIME_TO_DEPARTURE_THRESHOLD", "180"))
-            self.cancelled_flight_time_window_start = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_START", "60"))
-            self.cancelled_flight_time_window_end = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_END", "90"))
+            self.delay_threshold = int(os.getenv("DELAY_THRESHOLD", "5"))
+            self.time_to_departure_threshold = int(os.getenv("TIME_TO_DEPARTURE_THRESHOLD", "5"))
+            self.cancelled_flight_time_window_start = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_START", "5"))
+            self.cancelled_flight_time_window_end = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_END", "5"))
             self.api_host = os.getenv("API_HOST", "https://airlabs.co/api/v9")
             self.api_endpoint = os.getenv("API_ENDPOINT", "schedules")
             self.ignored_destinations_bcn = os.getenv("IGNORED_DESTINATIONS_BCN", "").split(",")
@@ -126,33 +126,36 @@ class FlightChecker:
 
     def load_flight_data(self):
         try:
-            with open("flights.json", 'r') as file:
-                data = file.read()
-                if not data:
-                    self.log.error("flights.json file is empty")
-                    return None
-                data = json.loads(data)
+            url = f"{self.api_host}/{self.api_endpoint}?dep_iata={self.airports}&api_key={self.api_key}"
+            response = requests.get(url)
+            response.raise_for_status()
+            flight_data = response.json().get('response')  # Assuming the flight data is present in the 'response' key
+            if not flight_data:
+                raise ValueError("No flight data in API response")
 
-            def find_delayed_in_dict(obj):
-                if "delayed" in obj:
-                    return obj["delayed"]
-                for k, v in obj.items():
-                    if isinstance(v, dict):
-                        item = find_delayed_in_dict(v)
-                        if item is not None:
-                            return item
+            # Store the API response as JSON in the file
+            filepath = "flights.json"
+            with open(filepath, 'w') as file:
+                json.dump(flight_data, file)
 
-            delayed_data = find_delayed_in_dict(data)
+            # Check the size of the file and delete if it exceeds 1GB
+            max_file_size = 1 * 1024 * 1024 * 1024  # 1 GB in bytes
+            if os.path.getsize(filepath) > max_file_size:
+                os.remove(filepath)
+                self.log.warning(f"File {filepath} exceeded the size limit and was deleted.")
 
-            if delayed_data is None:
-                raise ValueError("No flight delay data in response")
+            # Analyze flight data and return the delayed flights
+            delayed_data = self.analyze_flight_data(flight_data)
 
             return delayed_data
+
+        except requests.exceptions.RequestException as e:
+            self.log.error(f"Failed to load flight data from API: {str(e)}")
         except json.JSONDecodeError as e:
-            self.log.error(f"Error decoding JSON: {str(e)}")
+            self.log.error(f"Error decoding API response JSON: {str(e)}")
         except Exception as e:
             self.log.error(f"Error loading flight data: {str(e)}")
-
+            
     def analyze_delays(self, **context):
         """
         Analyzes flight delays for each airport and performs appropriate actions.
@@ -189,8 +192,7 @@ class FlightChecker:
                         ongoing_delays = True
 
                         flight_iata = flight[5]
-                        if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[
-                            airport]:
+                        if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[airport]:
                             continue  # Skip already processed delays
 
                         logging.info(f"Flight {flight_iata} is delayed for airport {airport}.")
