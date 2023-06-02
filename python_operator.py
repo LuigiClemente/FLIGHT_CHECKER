@@ -36,72 +36,44 @@ def validate_environment_variables():
             raise ValueError(f"Environment variable {var} is missing or empty")
 
 
+
 class FlightScraperManager:
     def __init__(self):
-        self.call_immediately = False
-
-    def reset(self):
-        """
-        Reset the FlightScraperManager and force an immediate Scrapy execution.
-        """
         self.call_immediately = True
 
-    def get_next_call_time(self, ongoing_delays, current_time):
-        if self.call_immediately or ongoing_delays:
+    def get_next_call_time(self, ongoing_delays, next_flight_time, current_time):
+        delay_threshold = int(os.getenv('DELAY_THRESHOLD', 1))
+        time_to_departure_threshold = int(os.getenv('TIME_TO_DEPARTURE_THRESHOLD', 1))
+        
+        if self.call_immediately or any(delay >= delay_threshold and time_to_departure > time_to_departure_threshold for delay, time_to_departure in ongoing_delays):
             self.call_immediately = False
-            next_call_time = current_time
+            return current_time
+        elif next_flight_time is not None:
+            return next_flight_time + timedelta(minutes=delay_threshold)
         else:
-            next_call_time = current_time + timedelta(minutes=60)  # Change delay as per your requirement
-        return next_call_time
+            return current_time + timedelta(minutes=60)
 
 
 class DelayedScrapyCallSensor(BaseSensorOperator):
     @apply_defaults
     def __init__(self, *args, **kwargs):
-        super(DelayedScrapyCallSensor, self).__init__(*args, **kwargs)
-        self.last_scrapy_call_time = None
+        super().__init__(*args, **kwargs)
+        self.last_scrapy_call_time = datetime.min
         self.flight_scraper_manager = FlightScraperManager()
 
     def poke(self, context):
-        ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays')
+        ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays') or []
+        next_flight_time = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='next_flight_time')
         current_time = datetime.now()
 
-        # If ongoing_delays is None, make it an empty list
-        if ongoing_delays is None:
-            ongoing_delays = []
+        next_call_time = self.flight_scraper_manager.get_next_call_time(ongoing_delays, next_flight_time, current_time)
 
-        next_call_time = self.flight_scraper_manager.get_next_call_time(ongoing_delays, current_time)
+        if current_time >= next_call_time:
+            self.last_scrapy_call_time = current_time  # Record the last successful Scrapy execution time
+            return True
 
-        # Check if next_call_time is None, if so set it to current_time
-        if next_call_time is None:
-            next_call_time = current_time
+        return False
 
-        # Now that next_call_time is not None, the comparison should work
-        if self.last_scrapy_call_time is None or self.last_scrapy_call_time < next_call_time:
-            if current_time >= next_call_time:
-                self.last_scrapy_call_time = current_time  # Record the last successful Scrapy execution time
-                return True
-            else:
-                return False
-        else:
-            return False
-
-# class FlightSpider(scrapy.Spider):
-#     name = "flight_spider"
-#     start_urls = ["https://www.amsterdam-airport.com/schiphol-departures"]
-#
-#     def parse(self, response):
-#         # Create a folder to store the file
-#         folder_name = "flight_data"
-#         if not os.path.exists(folder_name):
-#             os.makedirs(folder_name)
-#
-#         # Save the HTML content to a file
-#         html_filename = os.path.join(os.getcwd(), folder_name, "flight_html.html")
-#         with open(html_filename, 'wb') as f:
-#             f.write(response.body)
-#
-#         self.log("HTML content saved to file: %s" % html_filename)
 
 class FlightSpider(scrapy.Spider):
     name = "flight_spider"
@@ -114,24 +86,33 @@ class FlightSpider(scrapy.Spider):
     def parse(self, response):
         flight_data = []
 
-        rows = response.css(".flight-col")
+        rows = response.css(".flight-row")
 
         for row in rows:
-            destination = row.css(".flight-col:nth-child(1)::text").get()
-            departure = row.css(".flight-col:nth-child(3)::text").get()
-            flight_number = row.css(".flight-col:nth-child(4)::text").get()
-            airline = row.css(".flight-col:nth-child(5)::text").get()
-            status = row.css(".flight-col:nth-child(6)::text").get()
+            destination = row.css(".flight-col__dest b::text").get()
+            departure = row.css(".flight-col__hour::text").get()
+            flight_numbers = row.css(".flight-col__flight a::text").getall()  # Handle multiple flight numbers
+            airlines = row.css(".flight-col__airline a::text").getall()  # Handle multiple airlines
+            status = row.css(".flight-col__status a::text").get()
 
-            flight_info = {
-                "Destination": destination.strip(),
-                "Departure": departure.strip(),
-                "Flight": flight_number.strip(),
-                "Airline": airline.strip(),
-                "Status": status.strip()
-            }
+            if destination and departure and flight_numbers and airlines and status:
+                # Extract the first flight number from the list
+                first_flight_number = flight_numbers[0] if flight_numbers else None
 
-            flight_data.append(flight_info)
+                # Extract the first name of the airline from the list
+                first_airline_name = airlines[0].split()[0] if airlines else None
+
+                # Filter out specific statuses
+                if status.strip() not in ["En Route [+]", "Landed - Delayed [+]", "Landed - On-time [+]", "Scheduled - On-time [+]"]:
+                    flight_info = {
+                        "Destination": destination.strip(),
+                        "Departure": departure.strip(),
+                        "FlightNumber": first_flight_number.strip() if first_flight_number else None,
+                        "Airline": first_airline_name.strip() if first_airline_name else None,
+                        "Status": status.strip()
+                    }
+
+                    flight_data.append(flight_info)
 
         # Save flight data to JSON file
         filename = "flight_data.json"
@@ -144,15 +125,20 @@ class FlightSpider(scrapy.Spider):
         for flight in flight_data:
             destination = flight["Destination"]
             departure = flight["Departure"]
-            flight_number = flight["Flight"]
+            flight_number = flight["FlightNumber"]
             airline = flight["Airline"]
             status = flight["Status"]
 
-            print("Destination:", destination)
-            print("Departure:", departure)
-            print("Flight:", flight_number)
-            print("Airline:", airline)
-            print("Status:", status)
+            if destination:
+                print("Destination:", destination)
+            if departure:
+                print("Departure:", departure)
+            if flight_number:
+                print("Flight Number:", flight_number)
+            if airline:
+                print("Airline:", airline)
+            if status:
+                print("Status:", status)
             print()
 
 
