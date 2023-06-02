@@ -5,10 +5,12 @@ import json
 import time
 import csv
 import pytz
-import json
+import scrapy
+import subprocess
+from scrapy.crawler import CrawlerProcess
+from scrapy.utils.project import get_project_settings
+from datetime import datetime
 
-
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator
@@ -16,7 +18,6 @@ from airflow.sensors.base_sensor_operator import BaseSensorOperator
 from airflow.providers.jenkins.operators.jenkins_job_trigger import JenkinsJobTriggerOperator
 from airflow.utils.dates import timedelta
 from airflow.utils.decorators import apply_defaults
-
 
 load_dotenv()
 
@@ -26,7 +27,7 @@ def validate_environment_variables():
     Raises a ValueError if any of the required variables are missing or empty.
     """
     required_variables = [
-        "FLIGHTS_API_KEY", "AIRPORTS", "AIRLINES", "DELAY_THRESHOLD",
+        "URL", "AIRLINES", "DELAY_THRESHOLD",
         "TIME_TO_DEPARTURE_THRESHOLD", "CANCELLED_FLIGHT_TIME_WINDOW_START",
         "CANCELLED_FLIGHT_TIME_WINDOW_END"
     ]
@@ -34,26 +35,32 @@ def validate_environment_variables():
         if not os.getenv(var):
             raise ValueError(f"Environment variable {var} is missing or empty")
 
-class DelayManager:
+
+class FlightScraperManager:
     def __init__(self):
         self.call_immediately = False
 
     def reset(self):
         """
-        Reset the delay manager and force an immediate API call.
+        Reset the FlightScraperManager and force an immediate Scrapy execution.
         """
         self.call_immediately = True
 
     def get_next_call_time(self, ongoing_delays, current_time):
-        # Here, you should replace the placeholder with your original code
-        pass  # Placeholder for your original code
+        if self.call_immediately or ongoing_delays:
+            self.call_immediately = False
+            next_call_time = current_time
+        else:
+            next_call_time = current_time + timedelta(minutes=60)  # Change delay as per your requirement
+        return next_call_time
 
-class DelayedApiCallSensor(BaseSensorOperator):
+
+class DelayedScrapyCallSensor(BaseSensorOperator):
     @apply_defaults
     def __init__(self, *args, **kwargs):
-        super(DelayedApiCallSensor, self).__init__(*args, **kwargs)
-        self.last_api_call_time = None
-        self.delay_manager = DelayManager()
+        super(DelayedScrapyCallSensor, self).__init__(*args, **kwargs)
+        self.last_scrapy_call_time = None
+        self.flight_scraper_manager = FlightScraperManager()
 
     def poke(self, context):
         ongoing_delays = context['ti'].xcom_pull(task_ids='analyze_delays_task', key='ongoing_delays')
@@ -63,93 +70,160 @@ class DelayedApiCallSensor(BaseSensorOperator):
         if ongoing_delays is None:
             ongoing_delays = []
 
-        next_call_time = self.delay_manager.get_next_call_time(ongoing_delays, current_time)
+        next_call_time = self.flight_scraper_manager.get_next_call_time(ongoing_delays, current_time)
 
         # Check if next_call_time is None, if so set it to current_time
         if next_call_time is None:
             next_call_time = current_time
 
         # Now that next_call_time is not None, the comparison should work
-        if self.last_api_call_time is None or self.last_api_call_time < next_call_time:
+        if self.last_scrapy_call_time is None or self.last_scrapy_call_time < next_call_time:
             if current_time >= next_call_time:
-                self.last_api_call_time = current_time  # Record the last successful API call time
+                self.last_scrapy_call_time = current_time  # Record the last successful Scrapy execution time
                 return True
             else:
                 return False
         else:
             return False
 
-class FlightChecker:
+# class FlightSpider(scrapy.Spider):
+#     name = "flight_spider"
+#     start_urls = ["https://www.amsterdam-airport.com/schiphol-departures"]
+#
+#     def parse(self, response):
+#         # Create a folder to store the file
+#         folder_name = "flight_data"
+#         if not os.path.exists(folder_name):
+#             os.makedirs(folder_name)
+#
+#         # Save the HTML content to a file
+#         html_filename = os.path.join(os.getcwd(), folder_name, "flight_html.html")
+#         with open(html_filename, 'wb') as f:
+#             f.write(response.body)
+#
+#         self.log("HTML content saved to file: %s" % html_filename)
+
+class FlightSpider(scrapy.Spider):
+    name = "flight_spider"
+
+    def start_requests(self):
+        urls = os.getenv("URL").split(",")  # Split URLs by comma
+        for url in urls:
+            yield scrapy.Request(url=url, callback=self.parse)
+
+    def parse(self, response):
+        flight_data = []
+
+        rows = response.css(".flight-col")
+
+        for row in rows:
+            destination = row.css(".flight-col:nth-child(1)::text").get()
+            departure = row.css(".flight-col:nth-child(3)::text").get()
+            flight_number = row.css(".flight-col:nth-child(4)::text").get()
+            airline = row.css(".flight-col:nth-child(5)::text").get()
+            status = row.css(".flight-col:nth-child(6)::text").get()
+
+            flight_info = {
+                "Destination": destination.strip(),
+                "Departure": departure.strip(),
+                "Flight": flight_number.strip(),
+                "Airline": airline.strip(),
+                "Status": status.strip()
+            }
+
+            flight_data.append(flight_info)
+
+        # Save flight data to JSON file
+        filename = "flight_data.json"
+        with open(filename, 'w') as f:
+            json.dump(flight_data, f, indent=4)
+
+        self.log("Flight data saved to JSON file: %s" % filename)
+
+        # Filter and display the required flight information
+        for flight in flight_data:
+            destination = flight["Destination"]
+            departure = flight["Departure"]
+            flight_number = flight["Flight"]
+            airline = flight["Airline"]
+            status = flight["Status"]
+
+            print("Destination:", destination)
+            print("Departure:", departure)
+            print("Flight:", flight_number)
+            print("Airline:", airline)
+            print("Status:", status)
+            print()
+
+
+class FlightStatusMonitor:
     def __init__(self):
-        self.log = logging.getLogger(__name__)
+        self.logger = logging.getLogger(__name__)
+        self.delayInfo = []
         try:
-            self.api_key = os.getenv("FLIGHTS_API_KEY")
-            self.airports = os.getenv("AIRPORTS", "BCN,AMS")
-            self.airlines = os.getenv("AIRLINES")
-            self.delay_threshold = int(os.getenv("DELAY_THRESHOLD", "5"))
-            self.time_to_departure_threshold = int(os.getenv("TIME_TO_DEPARTURE_THRESHOLD", "5"))
-            self.cancelled_flight_time_window_start = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_START", "5"))
-            self.cancelled_flight_time_window_end = int(os.getenv("CANCELLED_FLIGHT_TIME_WINDOW_END", "5"))
-            self.api_host = os.getenv("API_HOST", "https://airlabs.co/api/v9")
-            self.api_endpoint = os.getenv("API_ENDPOINT", "schedules")
-            self.ignored_destinations_bcn = os.getenv("IGNORED_DESTINATIONS_BCN", "").split(",")
-            self.ignored_destinations_ams = os.getenv("IGNORED_DESTINATIONS_AMS", "").split(",")
-            self.last_delay_print_time = {}  # Stores the last delay print time for each airport
-
-            self.validate_environment_variables()
-
-            self.delayed_data = self.load_flight_data()  # Load flight data upon initializing the FlightChecker class
-            if self.delayed_data is None:
-                self.log.error("Failed to load flight data.")
-                raise ValueError("Failed to load flight data.")
-
-        except Exception as e:
-            self.log.error(f"Error initializing FlightChecker: {str(e)}")
+            self.confirm_environment_variables()
+            self.retrieve_flight_information()
+        except Exception as exception:
+            self.logger.error(f"An error occurred during the initialization of FlightStatusMonitor: {str(exception)}")
             raise
 
-    def validate_environment_variables(self):
-        required_env_variables = [
-            "FLIGHTS_API_KEY", "AIRPORTS", "AIRLINES", "DELAY_THRESHOLD",
-            "TIME_TO_DEPARTURE_THRESHOLD", "CANCELLED_FLIGHT_TIME_WINDOW_START",
-            "CANCELLED_FLIGHT_TIME_WINDOW_END", "API_HOST", "API_ENDPOINT",
-            "IGNORED_DESTINATIONS_BCN", "IGNORED_DESTINATIONS_AMS"
-        ]
+    def retrieve_flight_information(self):
+        process = subprocess.Popen(['scrapy', 'runspider', 'FlightSpider.py'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = process.communicate()
+        print("Stdout:", out)
+        print("Stderr:", err)
 
-        for var in required_env_variables:
-            if os.getenv(var) is None:
-                raise ValueError(f"Environment variable {var} is not set")
+    def fetch_flight_data(self):
+        """
+        Fetches the flight data by running the scrapy spider.
+        Returns a list of flight data.
+        """
+        logging.basicConfig(level=logging.INFO)
 
-    def load_flight_data(self):
+        process = CrawlerProcess(get_project_settings())
+        process.crawl(FlightSpider)
+        process.start()
+
+        flight_data = []
         try:
-            airports = self.airports.split(",")  # Split airports by comma
-            bcns = [airport for airport in airports if airport == "BCN"]  # Get BCN from airports
-            url = f"{self.api_host}/{self.api_endpoint}?dep_iata={','.join(bcns)}&api_key={self.api_key}"
+            with open("flight_data.json", 'r') as file:
+                flight_data = json.load(file)
+        except json.JSONDecodeError:
+            logging.error("Invalid or empty JSON file: flight_data.json")
 
-            response = requests.get(url)
-            response.raise_for_status()
-            api_data = response.json()  # Get the entire JSON response from the API
+        return flight_data
 
-            # Store the API response as JSON in the file
-            filepath = "flights.json"
-            with open(filepath, 'w') as file:
-                json.dump(api_data, file)
+    def write_flight_data_to_json(self, filename):
+        """
+        Writes the flight data to a JSON file.
+        """
+        flight_data = self.fetch_flight_data()
 
-            # Check the size of the file and delete if it exceeds 1 GB
-            max_file_size = 1 * 1024 * 1024 * 1024  # 1 GB in bytes
-            if os.path.getsize(filepath) > max_file_size:
-                os.remove(filepath)
-                logging.warning(f"File {filepath} exceeded the size limit and was deleted.")
+        with open(filename, 'w') as file:
+            json.dump(flight_data, file, indent=4)
 
-            return api_data
+        logging.info(f"Flight data saved to JSON file: {filename}")
 
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Failed to load flight data from API: {str(e)}")
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding API response JSON: {str(e)}")
-        except Exception as e:
-            logging.error(f"Error loading flight data: {str(e)}")
+    def confirm_environment_variables(self):
+        necessary_env_variables = ["URL"]
 
-        return None  # Return None when an error occurs
+        for variable in necessary_env_variables:
+            if os.getenv(variable) is None:
+                raise ValueError(f"The environment variable {variable} is not defined")
+
+    def save_flight_information_to_json(self, filename):
+        try:
+            with open("flight_info.json") as file:
+                flight_info = json.load(file)
+
+            if not flight_info:
+                raise ValueError("The flight information is unavailable.")
+
+            with open(filename, 'w') as file:
+                json.dump(flight_info, file, indent=4)
+
+        except Exception as exception:
+            self.logger.error(f"An error occurred while saving flight information to JSON: {str(exception)}")
 
     def analyze_delays(self):
         try:
@@ -159,6 +233,9 @@ class FlightChecker:
 
             ongoing_delays = False
             flights_list = []
+
+            ignored_destinations_bcn = ["https://www.barcelona-airport.com/eng/departures.php"]
+            ignored_destinations_ams = ["https://www.amsterdam-airport.com/schiphol-departures"]
 
             for flight in self.delayed_data:
                 if not isinstance(flight, dict):
@@ -171,9 +248,9 @@ class FlightChecker:
                     continue
 
                 if airport == "BCN":
-                    ignored_destinations = self.ignored_destinations_bcn
+                    ignored_destinations = ignored_destinations_bcn
                 elif airport == "AMS":
-                    ignored_destinations = self.ignored_destinations_ams
+                    ignored_destinations = ignored_destinations_ams
                 else:
                     continue
 
@@ -189,7 +266,7 @@ class FlightChecker:
                 ):
                     try:
                         dep_time = datetime.strptime(dep_time_str, "%Y-%m-%d %H:%M")
-                        dep_time = pytz.utc.localize(dep_time)  # Convert departure time to UTC
+                        dep_time = pytz.utc.localize(dep_time)
                     except ValueError:
                         self.log.warning(f"Invalid departure time format for flight: {flight}")
                         continue
@@ -206,18 +283,16 @@ class FlightChecker:
                             continue
 
                         if airport in self.last_delay_print_time and flight_iata in self.last_delay_print_time[airport]:
-                            continue  # Skip already processed delays
+                            continue
 
                         self.log.info(f"Flight {flight_iata} is delayed for airport {airport}.")
                         self.notify_plugin("Delayed", flight, airport=airport, flight_iata=flight_iata)
 
-                        # Update last delay print time
                         if airport in self.last_delay_print_time:
                             self.last_delay_print_time[airport].append(flight_iata)
                         else:
                             self.last_delay_print_time[airport] = [flight_iata]
 
-                        # Only acknowledge a cancelled flight if a delay has been printed for the same airport
                         if status == "cancelled":
                             time_since_last_delay = (
                                 datetime.now(pytz.utc) - self.last_delay_print_time[airport][-1]
@@ -229,7 +304,6 @@ class FlightChecker:
                                 self.log.info(f"Flight {flight_iata} is cancelled for airport {airport}.")
                                 self.notify_plugin("Cancelled", flight, airport=airport, flight_iata=flight_iata)
 
-                        # Add flight to the list for CSV creation
                         flights_list.append({
                             'Flight Number': flight_iata,
                             'Departure Airport': airport,
@@ -247,11 +321,6 @@ class FlightChecker:
             raise
 
     def create_csv_file(self, **context):
-        """
-        Creates a CSV file with flights that meet the specified conditions.
-        Args:
-            context (dict): The task context dictionary
-        """
         try:
             flights_list = context['ti'].xcom_pull(key='flights_list')
             if flights_list is None or not flights_list:
@@ -279,8 +348,26 @@ class FlightChecker:
             self.log.error(f"Error creating CSV file: {str(e)}")
             raise
 
-flight_checker = FlightChecker()
-flight_checker.analyze_delays()
+
+def fetch_flight_data(self):
+    """
+    Fetches the flight data by running the scrapy spider.
+    Returns a list of flight data.
+    """
+    logging.basicConfig(level=logging.INFO)
+
+    process = CrawlerProcess(get_project_settings())
+    process.crawl(FlightSpider)
+    process.start()
+
+    with open("flight_data.json", 'r') as file:
+        flight_data = json.load(file)
+
+    return flight_data
+
+# Usage example
+flight_checker = FlightStatusMonitor()
+flight_checker.write_flight_data_to_json("flight_data.json")
 
 default_args = {
     'start_date': datetime.strptime(os.getenv("DAG_START_DATE", "2023-05-21"), "%Y-%m-%d"),
@@ -295,16 +382,14 @@ with DAG(
     schedule_interval=timedelta(minutes=1),
     catchup=False
 ) as dag:
-    flight_checker = FlightChecker()
-
-    delayed_api_call_sensor = DelayedApiCallSensor(
-        task_id='delayed_api_call_sensor',
+    delayed_scrapy_call_sensor = DelayedScrapyCallSensor(
+        task_id='delayed_scrapy_call_sensor',
         dag=dag,
     )
 
     load_flight_data_task = PythonOperator(
         task_id='load_flight_data_task',
-        python_callable=flight_checker.load_flight_data,
+        python_callable=flight_checker.fetch_flight_data,
         provide_context=True,
         dag=dag,
     )
@@ -317,19 +402,19 @@ with DAG(
     )
 
     create_csv_file_task = PythonOperator(
-    task_id='create_csv_file_task',
-    python_callable=flight_checker.create_csv_file,
-    provide_context=True,
-    dag=dag
+        task_id='create_csv_file_task',
+        python_callable=flight_checker.create_csv_file,
+        provide_context=True,
+        dag=dag,
     )
 
     jenkins_trigger = JenkinsJobTriggerOperator(
-    task_id='trigger_jenkins_job',
-    job_name=os.getenv("JENKINS_JOB_NAME"),
-    jenkins_connection_id=os.getenv("JENKINS_CONNECTION_ID"),
-    parameters=json.loads(os.getenv("JENKINS_PARAMETERS", '{"key": "value"}')),
-    sleep_time=int(os.getenv("JENKINS_SLEEP_TIME", "30")),
-    dag=dag,
-)
+        task_id='trigger_jenkins_job',
+        job_name=os.getenv("JENKINS_JOB_NAME"),
+        jenkins_connection_id=os.getenv("JENKINS_CONNECTION_ID"),
+        parameters=json.loads(os.getenv("JENKINS_PARAMETERS", '{"key": "value"}')),
+        sleep_time=int(os.getenv("JENKINS_SLEEP_TIME", "30")),
+        dag=dag,
+    )
 
-delayed_api_call_sensor >> load_flight_data_task >> analyze_delays_task >> create_csv_file_task >> jenkins_trigger
+    delayed_scrapy_call_sensor >> load_flight_data_task >> analyze_delays_task >> create_csv_file_task >> jenkins_trigger
