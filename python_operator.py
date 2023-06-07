@@ -30,9 +30,7 @@ class FlightStatusMonitor:
 
     def retrieve_flight_schedules(self):
         session = HTMLSession()
-        url = os.getenv("URL")
-        if url is None:
-            raise ValueError("Environment variable 'URL' is not defined")
+        url = "https://www.amsterdam-airport.com/schiphol-departures"
 
         response = session.get(url)
         rows = response.html.find(".flight-row")
@@ -107,4 +105,5 @@ with DAG(
     )
 
     retrieve_flight_schedules_task
+
 
